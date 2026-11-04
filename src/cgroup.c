@@ -1,85 +1,95 @@
 #define _GNU_SOURCE
-#include <sched.h>      /* clone */
 #include <stdio.h>
-#include <unistd.h>     /* chroot, chdir, execv, pipe, read, write, close */
-#include <signal.h>     /* SIGCHLD */
-#include <sys/mount.h>  /* mount */
-#include <sys/wait.h>   /* waitpid */
-#include "container.h"
-#include "image.h"
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include "cgroup.h"
 
-/* Child ko ye cheezein chahiye, isliye global rakhi hain */
-static const char *g_rootfs;     /* alpine folder */
-static char *const *g_cmd;       /* command, jaise /bin/sh */
-static int g_pipe[2];            /* Lab 8: parent -> child signal */
+static char cgroup_path[256];
 
-static char child_stack[1024 * 1024];   /* child ka stack (1 MB) */
-
-/* ---------- CHILD: container ke andar chalta hai ---------- */
-static int child_main(void *arg) {
-    char c;
-    (void)arg;
-
-    
-    close(g_pipe[1]);               
-    read(g_pipe[0], &c, 1);
-    close(g_pipe[0]);
-
-    sethostname("minidocker", 10);   
-
-    mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
-
-    if (chroot(g_rootfs) != 0) {
-        perror("chroot failed");
-        return 1; 
+// Helper function (Lab 5: open, write, close)
+static void write_file(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY);
+    if (fd >= 0) {
+        write(fd, value, strlen(value));
+        close(fd);
     }
-   if (chdir("/") != 0) {
-    perror("chdir failed"); 
-    return 1;               
 }
 
-    mount("proc", "/proc", "proc", 0, NULL);  
-    execv(g_cmd[0], g_cmd);        
-    perror("execv");                
-    return 1;
-}
+// 1. LIMIT LAGANE WALA FUNCTION
+int limit_pid(int pid, char *mem, char *pids) {
+    char path[512]; // Size barha di taake warning na aaye
 
+    // Cgroup v2 ka path
+    snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/minidocker/p%d", pid);
 
-int run_container(const char *rootfs, char *const argv[]) {
-    int status;
+    // Folders banao
+    mkdir("/sys/fs/cgroup/minidocker", 0755);
+    mkdir(cgroup_path, 0755);
 
-    if (image_check(rootfs) != 0)    
-        return 1;
+    // Controllers enable karo (Memory aur PID)
+    write_file("/sys/fs/cgroup/minidocker/cgroup.subtree_control", "+memory +pids");
 
-    g_rootfs = rootfs;
-    g_cmd = argv;
-    pipe(g_pipe);                 
+    // Memory limit set karo
+    snprintf(path, sizeof(path), "%s/memory.max", cgroup_path);
+    write_file(path, mem);
 
-    int flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD;
-    pid_t pid = clone(child_main, child_stack + sizeof(child_stack), flags, NULL);
-    if (pid < 0) {
-        perror("clone");
-        return 1;
-    }
-    printf("Container started, host PID = %d\n", pid);
+    // Swap memory ko band karo
+    snprintf(path, sizeof(path), "%s/memory.swap.max", cgroup_path);
+    write_file(path, "0");
 
-    close(g_pipe[0]);         
+    // Maximum processes limit set karo
+    snprintf(path, sizeof(path), "%s/pids.max", cgroup_path);
+    write_file(path, pids);
 
-   
-    if (limit_pid(pid, "50M", "20") != 0)
-        printf("Warning: limit nahi lagi\n");
+    // Process ki PID ko cgroup mein daalo
+    snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup_path);
+    char pid_str[16];
+    snprintf(pid_str, sizeof(pid_str), "%d", pid);
+    write_file(path, pid_str);
 
-    write(g_pipe[1], "g", 1);        
-    close(g_pipe[1]);
-
-    waitpid(pid, &status, 0);      
-    if (WIFEXITED(status))
-        printf("Container exited with code %d\n", WEXITSTATUS(status));
-    else if (WIFSIGNALED(status))
-        printf("Container killed by signal %d\n", WTERMSIG(status));
-
-    show_status();                  
-    cleanup_cgroup();              
     return 0;
+}
+
+// 2. STATUS DIKHANE WALA FUNCTION
+void show_status() {
+    char path[512], buf[128];
+    int fd, n;
+
+    printf("\n--- Cgroup Status ---\n");
+
+    // Memory use check karo
+    snprintf(path, sizeof(path), "%s/memory.current", cgroup_path);
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        n = read(fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            printf("Memory Used: %s", buf);
+        }
+        close(fd);
+    }
+
+    // OOM Kill check karo
+    snprintf(path, sizeof(path), "%s/memory.events", cgroup_path);
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        n = read(fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            if (strstr(buf, "oom_kill 1")) {
+                printf("Result: KILLED (memory limit exceeded)\n");
+            } else {
+                printf("Result: RUNNING / EXITED normally\n");
+            }
+        }
+        close(fd);
+    }
+}
+
+// 3. CLEANUP WALA FUNCTION
+void cleanup_cgroup() {
+    rmdir(cgroup_path);
 }
