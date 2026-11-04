@@ -31,8 +31,14 @@ static int child_main(void *arg) {
   
     mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
 
-    if (chroot(a->rootfs) != 0) { perror("chroot"); return 1; }
-    chdir("/");
+    if (chroot(a->rootfs) != 0) { 
+        perror("chroot"); 
+        return 1;
+    }
+ if (chdir("/") != 0) {
+    perror("chdir failed in container.c");
+    return 1;
+}
 
 
     mount("proc", "/proc", "proc", 0, NULL);
