@@ -31,7 +31,10 @@ static int child_main(void *arg) {
     /* mounts host se alag rakho */
     mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
 
-    chroot(g_rootfs);                /* alpine folder ko "/" bana do */
+    if (chroot(g_rootfs) != 0) {
+        perror("chroot failed");
+        return 1; 
+    }
     chdir("/");                      /* chroot ke baad zaroori */
 
     mount("proc", "/proc", "proc", 0, NULL);  
