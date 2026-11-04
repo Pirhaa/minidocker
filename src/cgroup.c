@@ -21,21 +21,23 @@ static int child_main(void *arg) {
     char c;
     (void)arg;
 
-    /* Lab 8: pipe se parent ka "go" milne tak ruko */
-    close(g_pipe[1]);                /* child sirf padhega */
+    
+    close(g_pipe[1]);               
     read(g_pipe[0], &c, 1);
     close(g_pipe[0]);
 
-    sethostname("minidocker", 10);   /* container ka apna hostname */
+    sethostname("minidocker", 10);   
 
-    /* mounts host se alag rakho */
     mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
 
     if (chroot(g_rootfs) != 0) {
         perror("chroot failed");
         return 1; 
     }
-    chdir("/");                      /* chroot ke baad zaroori */
+   if (chdir("/") != 0) {
+    perror("chdir failed"); 
+    return 1;               
+}
 
     mount("proc", "/proc", "proc", 0, NULL);  
     execv(g_cmd[0], g_cmd);        
