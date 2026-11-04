@@ -1,6 +1,8 @@
-#ifndef CONTAINER_H
-#define CONTAINER_H
+#ifndef CGROUP_H
+#define CGROUP_H
 
-int run_container(const char *rootfs, char *const argv[]);
+int limit_pid(int pid, char *mem, char *pids);
+void show_status();
+void cleanup_cgroup();
 
 #endif
