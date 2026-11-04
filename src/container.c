@@ -112,7 +112,7 @@ int run_container(const char *rootfs, char *const argv[]) {
     }
 
     // Status dikhao aur cleanup karo (Ye bhi cgroup.c se aayega)
-    show_status();
+    show_status(pid);
     cleanup_cgroup();
 
     free(stack);
