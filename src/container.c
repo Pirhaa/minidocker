@@ -1,95 +1,120 @@
 #define _GNU_SOURCE
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include "cgroup.h"
+#include <signal.h>
+#include <sys/mount.h>
+#include <sys/wait.h>
+#include "container.h"
+#include "image.h"
+#include "cgroup.h"  // Cgroup functions call karne ke liye
+#include "overlay.h" // Overlay setup ke liye
 
-static char cgroup_path[256];
+#define STACK_SIZE (1024 * 1024)
 
-// File mein value likhne ka helper function (Lab 5 concept)
-static void write_file(const char *path, const char *value) {
-    int fd = open(path, O_WRONLY);
-    if (fd >= 0) {
-        write(fd, value, strlen(value));
-        close(fd);
+struct child_args {
+    const char *rootfs;     
+    char *const *cmd;      
+    int pipefd[2];         
+    char merged_dir[512];  // Overlay ke liye
+};
+
+static int child_main(void *arg) {
+    struct child_args *a = (struct child_args *)arg;
+    char c;
+
+    // 1. Pipe synchronization (Lab 8)
+    close(a->pipefd[1]);
+    read(a->pipefd[0], &c, 1);
+    close(a->pipefd[0]);
+
+    // 2. Hostname set karo (Lab 6/7)
+    sethostname("minidocker", 10);
+
+    // 3. Mount private (Lab 7)
+    mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
+
+    // 4. Overlay Setup Call
+    if (setup_overlay(a->rootfs, "test", a->merged_dir) != 0) {
+        perror("setup_overlay");
+        return 1;
     }
+
+    // 5. Chroot ab direct rootfs nahi, balke merged_dir par
+    if (chroot(a->merged_dir) != 0) { 
+        perror("chroot"); 
+        return 1;
+    }
+
+    if (chdir("/") != 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    // 6. /proc mount karo
+    mount("proc", "/proc", "proc", 0, NULL);
+
+    // 7. Shell chalao
+    execv(a->cmd[0], a->cmd);
+    
+    perror("execv");
+    return 1;
 }
 
-// 1. LIMIT LAGANE WALA FUNCTION
-int limit_pid(int pid, char *mem, char *pids) {
-    char path[256];
+int run_container(const char *rootfs, char *const argv[]) {
+    struct child_args args;
 
-    // Cgroup v2 ka path
-    snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/minidocker/p%d", pid);
+    if (image_check(rootfs) != 0) return 1;
 
-    // Folders banao
-    mkdir("/sys/fs/cgroup/minidocker", 0755);
-    mkdir(cgroup_path, 0755);
+    args.rootfs = rootfs;
+    args.cmd = argv;
 
-    // Controllers enable karo (Memory aur PID limit ke liye)
-    write_file("/sys/fs/cgroup/minidocker/cgroup.subtree_control", "+memory +pids");
+    if (pipe(args.pipefd) < 0) { 
+        perror("pipe"); 
+        return 1; 
+    }
 
-    // Memory limit set karo
-    snprintf(path, sizeof(path), "%s/memory.max", cgroup_path);
-    write_file(path, mem);
+    char *stack = malloc(STACK_SIZE);
+    if (!stack) { 
+        perror("malloc"); 
+        return 1; 
+    }
 
-    // Swap memory ko band karo
-    snprintf(path, sizeof(path), "%s/memory.swap.max", cgroup_path);
-    write_file(path, "0");
+    int flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD;
+    pid_t pid = clone(child_main, stack + STACK_SIZE, flags, &args);
+    
+    if (pid < 0) { 
+        perror("clone"); 
+        free(stack); 
+        return 1; 
+    }
 
-    // Maximum processes limit set karo
-    snprintf(path, sizeof(path), "%s/pids.max", cgroup_path);
-    write_file(path, pids);
+    printf("Container started, host PID = %d\n", pid);
 
-    // Process ki PID ko cgroup mein daalo
-    snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup_path);
-    char pid_str[16];
-    snprintf(pid_str, sizeof(pid_str), "%d", pid);
-    write_file(path, pid_str);
+    // Pipe sync
+    close(args.pipefd[0]);
+    write(args.pipefd[1], "g", 1);
+    close(args.pipefd[1]);
 
+    // Cgroup limit apply karo (Ye function cgroup.c mein hai)
+    if (limit_pid(pid, "50M", "20") != 0) {
+        printf("Warning: cgroup limits failed\n");
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+    
+    if (WIFEXITED(status)) {
+        printf("Container exited with code %d\n", WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        printf("Container killed by signal %d\n", WTERMSIG(status));
+    }
+
+    // Status dikhao aur cleanup karo (Ye bhi cgroup.c se aayega)
+    show_status();
+    cleanup_cgroup();
+
+    free(stack);
     return 0;
-}
-
-// 2. STATUS DIKHANE WALA FUNCTION
-void show_status() {
-    char path[256], buf[128];
-    int fd, n;
-
-    printf("\n--- Cgroup Status ---\n");
-
-    // Memory use check karo
-    snprintf(path, sizeof(path), "%s/memory.current", cgroup_path);
-    fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        n = read(fd, buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
-            printf("Memory Used: %s", buf);
-        }
-        close(fd);
-    }
-
-    // OOM Kill check karo
-    snprintf(path, sizeof(path), "%s/memory.events", cgroup_path);
-    fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        n = read(fd, buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
-            if (strstr(buf, "oom_kill 1")) {
-                printf("Result: KILLED (memory limit exceeded)\n");
-            } else {
-                printf("Result: RUNNING / EXITED normally\n");
-            }
-        }
-        close(fd);
-    }
-}
-
-// 3. CLEANUP WALA FUNCTION
-void cleanup_cgroup() {
-    rmdir(cgroup_path);
 }
